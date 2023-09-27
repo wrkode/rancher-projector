@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
@@ -21,11 +22,12 @@ type ProjectEvent struct {
 }
 
 func main() {
-	// Load the API endpoint from the environment variable
-	apiEndpoint, exists := os.LookupEnv("API_ENDPOINT")
-	if !exists {
-		log.Fatal("API_ENDPOINT not set")
+	// Load the API endpoints from the environment variable
+	apiEndpoints, exists := os.LookupEnv("API_ENDPOINTS")
+	if !exists || apiEndpoints == "" {
+		log.Fatal("API_ENDPOINTS not set or empty")
 	}
+	endpoints := strings.Split(apiEndpoints, ",")
 
 	// Create the in-cluster config
 	config, err := rest.InClusterConfig()
@@ -57,7 +59,9 @@ func main() {
 					namespace := project.GetNamespace()
 					name := project.GetName()
 					fmt.Printf("Detected new Rancher project. Namespace: %s, Name: %s\n", namespace, name)
-					sendProjectEvent(apiEndpoint, namespace, name)
+					for _, endpoint := range endpoints {
+						sendProjectEvent(strings.TrimSpace(endpoint), namespace, name)
+					}
 				}
 			},
 		},
@@ -83,12 +87,12 @@ func sendProjectEvent(apiEndpoint, namespace, name string) {
 
 	resp, err := http.Post(apiEndpoint, "application/json", bytes.NewBuffer(data))
 	if err != nil {
-		log.Printf("Failed to send event to API: %v", err)
+		log.Printf("Failed to send event to API (%s): %v", apiEndpoint, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("Received non-OK response from API: %v", resp.Status)
+		log.Printf("Received non-OK response from API (%s): %v", apiEndpoint, resp.Status)
 	}
 }
