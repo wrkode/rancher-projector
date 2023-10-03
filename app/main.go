@@ -2,52 +2,82 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"log"
 	"net/http"
 	"os"
-	"strings"
-
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 )
 
 type ProjectEvent struct {
-	Namespace string `json:"namespace"`
-	Name      string `json:"name"`
+	Namespace   string            `json:"namespace"`
+	Name        string            `json:"name"`
+	Annotations map[string]string `json:"annotations"`
 }
 
+var httpClient = &http.Client{}
+var debugOutput = true // Set to false to disable debugging output
+
 func main() {
-	// Load the API endpoints from the environment variable
-	apiEndpoints, exists := os.LookupEnv("API_ENDPOINTS")
-	if !exists || apiEndpoints == "" {
-		log.Fatal("API_ENDPOINTS not set or empty")
+	bearerToken := os.Getenv("BEARER_TOKEN")
+	if bearerToken == "" {
+		log.Fatal("BEARER_TOKEN is not set or empty")
 	}
-	endpoints := strings.Split(apiEndpoints, ",")
+
+	rancherFQDN := os.Getenv("RANCHER_FQDN")
+	if rancherFQDN == "" {
+		log.Fatal("RANCHER_FQDN is not set or empty")
+	}
 
 	// Create the in-cluster config
+	skipTLSVerify := false
+	if os.Getenv("skipTLSVerify") == "true" {
+		skipTLSVerify = true
+	}
+
+	if skipTLSVerify {
+		httpClient.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+	}
+
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatalf("Failed to create in-cluster config: %v", err)
 	}
 
-	// Create the Kubernetes client
-	clientset, err := kubernetes.NewForConfig(config)
+	dynamicClient, err := dynamic.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("Failed to create Kubernetes client: %v", err)
+		log.Fatalf("Failed to create dynamic client: %v", err)
 	}
 
-	// Watch for changes in the Rancher projects
-	watchlist := cache.NewListWatchFromClient(
-		clientset.RESTClient(),
-		"projects.management.cattle.io",
-		"",
-		fields.Everything(),
-	)
+	// Define the GroupVersionResource for projects.management.cattle.io
+	gvr := schema.GroupVersionResource{
+		Group:    "management.cattle.io",
+		Version:  "v3", // Adjust the version as needed
+		Resource: "projects",
+	}
+
+	dynamicInterface := dynamicClient.Resource(gvr).Namespace(v1.NamespaceAll)
+	watchlist := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return dynamicInterface.List(context.TODO(), options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return dynamicInterface.Watch(context.TODO(), options)
+		},
+	}
 
 	_, controller := cache.NewInformer(
 		watchlist,
@@ -58,10 +88,23 @@ func main() {
 				if project, ok := obj.(*unstructured.Unstructured); ok {
 					namespace := project.GetNamespace()
 					name := project.GetName()
-					fmt.Printf("Detected new Rancher project. Namespace: %s, Name: %s\n", namespace, name)
-					for _, endpoint := range endpoints {
-						sendProjectEvent(strings.TrimSpace(endpoint), namespace, name)
+					annotations := make(map[string]string)
+
+					// Extract annotations
+					if meta, ok := project.Object["metadata"].(map[string]interface{}); ok {
+						if annos, ok := meta["annotations"].(map[string]interface{}); ok {
+							for key, value := range annos {
+								strValue, _ := value.(string)
+								annotations[key] = strValue
+							}
+						}
 					}
+
+					fmt.Printf("Detected new Rancher project. Namespace: %s, Name: %s\n", namespace, name)
+
+					// Form endpoint dynamically
+					endpoint := fmt.Sprintf("https://%s/k8s/clusters/%s/api/v1/namespaces/kube-system/services/http:rancher-selector-service:8080/proxy/", rancherFQDN, namespace)
+					sendProjectEvent(endpoint, namespace, name, annotations, bearerToken)
 				}
 			},
 		},
@@ -74,10 +117,11 @@ func main() {
 	select {}
 }
 
-func sendProjectEvent(apiEndpoint, namespace, name string) {
+func sendProjectEvent(apiEndpoint, namespace, name string, annotations map[string]string, bearerToken string) {
 	event := ProjectEvent{
-		Namespace: namespace,
-		Name:      name,
+		Namespace:   namespace,
+		Name:        name,
+		Annotations: annotations,
 	}
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -85,7 +129,24 @@ func sendProjectEvent(apiEndpoint, namespace, name string) {
 		return
 	}
 
-	resp, err := http.Post(apiEndpoint, "application/json", bytes.NewBuffer(data))
+	// Debugging Output
+	if debugOutput {
+		log.Println("Sending JSON Data:", string(data))
+	}
+
+	// Create a new request
+	req, err := http.NewRequest("POST", apiEndpoint, bytes.NewBuffer(data))
+	if err != nil {
+		log.Printf("Failed to create a new request: %v", err)
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Use the customized client to send the request
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("Failed to send event to API (%s): %v", apiEndpoint, err)
 		return
