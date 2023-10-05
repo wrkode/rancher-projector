@@ -27,7 +27,7 @@ type ProjectEvent struct {
 }
 
 var httpClient = &http.Client{}
-var debugOutput = false // Set to false to disable debugging output
+var debugOutput = true // Set to false to disable debugging output
 
 func main() {
 	bearerToken := os.Getenv("BEARER_TOKEN")
