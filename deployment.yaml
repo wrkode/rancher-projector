@@ -12,7 +12,6 @@ metadata:
 rules:
   - apiGroups: ["*"]
     resources: ["*"]
-    #verbs: ["list", "watch", "get"]
     verbs: ["*"]
 
 ---
@@ -49,7 +48,7 @@ spec:
       serviceAccountName: rancher-projector-sa
       containers:
         - name: rancher-projector
-          image: wrkode/rancher-projector:dev
+          image: wrkode/rancher-projector:0.9
           imagePullPolicy: Always
           env:
             - name: BEARER_TOKEN
@@ -58,6 +57,6 @@ spec:
                   name: rancher-projector-secret
                   key: token
             - name: RANCHER_FQDN
-              value: "rancher.lab.k8"
+              value: "RANCHERFQDN"
             - name: skipTLSVerify
               value: "true"

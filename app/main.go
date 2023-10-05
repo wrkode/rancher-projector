@@ -27,7 +27,7 @@ type ProjectEvent struct {
 }
 
 var httpClient = &http.Client{}
-var debugOutput = true // Set to false to disable debugging output
+var debugOutput = false // Set to false to disable debugging output
 
 func main() {
 	bearerToken := os.Getenv("BEARER_TOKEN")
@@ -85,27 +85,13 @@ func main() {
 		0,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				if project, ok := obj.(*unstructured.Unstructured); ok {
-					namespace := project.GetNamespace()
-					name := project.GetName()
-					annotations := make(map[string]string)
-
-					// Extract annotations
-					if meta, ok := project.Object["metadata"].(map[string]interface{}); ok {
-						if annos, ok := meta["annotations"].(map[string]interface{}); ok {
-							for key, value := range annos {
-								strValue, _ := value.(string)
-								annotations[key] = strValue
-							}
-						}
-					}
-
-					fmt.Printf("Detected new Rancher project. Namespace: %s, Name: %s\n", namespace, name)
-
-					// Form endpoint dynamically
-					endpoint := fmt.Sprintf("https://%s/k8s/clusters/%s/api/v1/namespaces/kube-system/services/http:rancher-selector-service:8080/proxy/", rancherFQDN, namespace)
-					sendProjectEvent(endpoint, namespace, name, annotations, bearerToken)
-				}
+				handleProjectEvent(obj, "add", rancherFQDN, bearerToken)
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				handleProjectEvent(newObj, "update", rancherFQDN, bearerToken)
+			},
+			DeleteFunc: func(obj interface{}) {
+				handleProjectEvent(obj, "delete", rancherFQDN, bearerToken)
 			},
 		},
 	)
@@ -117,7 +103,34 @@ func main() {
 	select {}
 }
 
-func sendProjectEvent(apiEndpoint, namespace, name string, annotations map[string]string, bearerToken string) {
+func handleProjectEvent(obj interface{}, eventType, rancherFQDN, bearerToken string) {
+	if project, ok := obj.(*unstructured.Unstructured); ok {
+		namespace := project.GetNamespace()
+		name := project.GetName()
+		annotations := make(map[string]string)
+
+		// Extract annotations
+		if meta, ok := project.Object["metadata"].(map[string]interface{}); ok {
+			if annos, ok := meta["annotations"].(map[string]interface{}); ok {
+				for key, value := range annos {
+					strValue, _ := value.(string)
+					annotations[key] = strValue
+				}
+			}
+		}
+
+		switch eventType {
+		case "add", "update":
+			endpoint := fmt.Sprintf("https://%s/k8s/clusters/%s/api/v1/namespaces/kube-system/services/http:rancher-selector-service:8080/proxy/", rancherFQDN, namespace)
+			sendProjectEvent(endpoint, namespace, name, annotations, bearerToken, "POST")
+		case "delete":
+			endpoint := fmt.Sprintf("https://%s/k8s/clusters/%s/api/v1/namespaces/kube-system/services/http:rancher-selector-service:8080/proxy/delete", rancherFQDN, namespace)
+			sendProjectEvent(endpoint, namespace, name, annotations, bearerToken, "DELETE")
+		}
+	}
+}
+
+func sendProjectEvent(apiEndpoint, namespace, name string, annotations map[string]string, bearerToken, method string) {
 	event := ProjectEvent{
 		Namespace:   namespace,
 		Name:        name,
@@ -134,8 +147,7 @@ func sendProjectEvent(apiEndpoint, namespace, name string, annotations map[strin
 		log.Println("Sending JSON Data:", string(data))
 	}
 
-	// Create a new request
-	req, err := http.NewRequest("POST", apiEndpoint, bytes.NewBuffer(data))
+	req, err := http.NewRequest(method, apiEndpoint, bytes.NewBuffer(data))
 	if err != nil {
 		log.Printf("Failed to create a new request: %v", err)
 		return
@@ -145,7 +157,6 @@ func sendProjectEvent(apiEndpoint, namespace, name string, annotations map[strin
 	req.Header.Set("Authorization", "Bearer "+bearerToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Use the customized client to send the request
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Printf("Failed to send event to API (%s): %v", apiEndpoint, err)
